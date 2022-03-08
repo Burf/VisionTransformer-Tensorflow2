@@ -18,7 +18,6 @@ The implementation is based on papers[[1](https://arxiv.org/abs/2010.11929v2), [
 
 - Python 3
 - tensorflow 2
-- torch 1.1▲
 
 ## Reference
 
