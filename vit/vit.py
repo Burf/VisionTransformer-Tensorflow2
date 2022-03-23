@@ -2,24 +2,47 @@ import tensorflow as tf
 import numpy as np
 
 class MultiHeadSelfAttention(tf.keras.layers.Layer):
-    def __init__(self, emb_dim = 768, n_head = 12, dropout_rate = 0., kernel_initializer = tf.keras.initializers.RandomNormal(mean = 0, stddev = 0.01), **kwargs):
+    def __init__(self, emb_dim = 768, n_head = 12, out_dim = None, relative_window_size = None, dropout_rate = 0., kernel_initializer = tf.keras.initializers.RandomNormal(mean = 0, stddev = 0.01), **kwargs):
         #ScaledDotProductAttention
         super(MultiHeadSelfAttention, self).__init__(**kwargs)
         self.emb_dim = emb_dim
         self.n_head = n_head
         if emb_dim % n_head != 0:
             raise ValueError("Shoud be embedding dimension % number of heads = 0.")
+        if out_dim is None:
+            out_dim = self.emb_dim
+        self.out_dim = out_dim
+        if relative_window_size is not None and np.ndim(relative_window_size) == 0:
+            relative_window_size = [relative_window_size, relative_window_size]
+        self.relative_window_size = relative_window_size
         self.projection_dim = emb_dim // n_head
         self.dropout_rate = dropout_rate
         self.query = tf.keras.layers.Dense(emb_dim, kernel_initializer = kernel_initializer)
         self.key = tf.keras.layers.Dense(emb_dim, kernel_initializer = kernel_initializer)
         self.value = tf.keras.layers.Dense(emb_dim, kernel_initializer = kernel_initializer)
-        self.combine = tf.keras.layers.Dense(emb_dim, kernel_initializer = kernel_initializer)
-    
-    def attention(self, query, key, value):
+        self.combine = tf.keras.layers.Dense(out_dim, kernel_initializer = kernel_initializer)
+        
+    def build(self, input_shape):
+        if self.relative_window_size is not None:
+            self.relative_position_bias_table = self.add_weight("relative_position_bias_table", shape = [((2 * self.relative_window_size[0]) - 1) * ((2 * self.relative_window_size[1]) - 1), self.n_head], trainable = self.trainable)
+            coords_h = np.arange(self.relative_window_size[0])
+            coords_w = np.arange(self.relative_window_size[1])
+            coords = np.stack(np.meshgrid(coords_h, coords_w, indexing = "ij")) #2, Wh, Ww
+            coords = np.reshape(coords, [2, -1])
+            relative_coords = np.expand_dims(coords, axis = -1) - np.expand_dims(coords, axis = -2) #2, Wh * Ww, Wh * Ww
+            relative_coords = np.transpose(relative_coords, [1, 2, 0]) #Wh * Ww, Wh * Ww, 2
+            relative_coords[:, :, 0] += self.relative_window_size[0] - 1 #shift to start from 0
+            relative_coords[:, :, 1] += self.relative_window_size[1] - 1
+            relative_coords[:, :, 0] *= 2 * self.relative_window_size[1] - 1
+            relative_position_index = np.sum(relative_coords, -1)
+            self.relative_position_index = tf.Variable(tf.convert_to_tensor(relative_position_index), trainable = False, name= "relative_position_index")
+        
+    def attention(self, query, key, value, relative_position_bias = None):
         score = tf.matmul(query, key, transpose_b = True)
         n_key = tf.cast(tf.shape(key)[-1], tf.float32)
         scaled_score = score / tf.math.sqrt(n_key)
+        if relative_position_bias is not None:
+            scaled_score = scaled_score + relative_position_bias
         weight = tf.nn.softmax(scaled_score, axis = -1)
         if 0 < self.dropout_rate:
             weight = tf.nn.dropout(weight, self.dropout_rate)
@@ -39,8 +62,14 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
         query = self.separate_head(query)
         key = self.separate_head(key)
         value = self.separate_head(value)
-
-        attention = self.attention(query, key, value)
+        
+        relative_position_bias = None
+        if self.relative_window_size is not None:
+            relative_position_bias = tf.gather(self.relative_position_bias_table, tf.reshape(self.relative_position_index, [-1]))
+            relative_position_bias = tf.reshape(relative_position_bias, [self.relative_window_size[0] * self.relative_window_size[1], self.relative_window_size[0] * self.relative_window_size[1], -1]) #Wh * Ww,Wh * Ww, nH
+            relative_position_bias = tf.transpose(relative_position_bias, [2, 0, 1]) #nH, Wh * Ww, Wh * Ww
+            relative_position_bias = tf.expand_dims(relative_position_bias, axis = 0)
+        attention = self.attention(query, key, value, relative_position_bias)
         attention = tf.keras.layers.Permute([2, 1, 3])(attention)
         attention = tf.keras.layers.Reshape([-1, self.emb_dim])(attention)
         
@@ -51,6 +80,8 @@ class MultiHeadSelfAttention(tf.keras.layers.Layer):
         config = super(MultiHeadSelfAttention, self).get_config()
         config["emb_dim"] = self.emb_dim
         config["n_head"] = self.n_head
+        config["out_dim"] = self.out_dim
+        config["relative_window_size"] = self.relative_window_size
         config["projection_dim"] = self.projection_dim
         config["dropout_rate"] = self.dropout_rate
         return config
